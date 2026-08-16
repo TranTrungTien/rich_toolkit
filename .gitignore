@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Virtualenvs (tao boi cac script trong scripts/)
+.venv/
+.venv-*/
+venv/
+
+# Cau hinh ca nhan — chep .env.example thanh .env roi dien
+.env
+
+# Ket qua chay pipeline
+output/
+downloads/
+batch_state.json
+logs/
+
+# Du lieu ca nhan
+linkdouyin.txt
+
+# Models (nhieu GB; tai ve bang cac script trong scripts/)
+models/
+
+# Giong nguoi dung tu them (voices/preset_voices_vn/ VAN duoc commit)
+voices/custom/
+voices/*.wav
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.claude/
+
+# Build exe
+*.spec.bak
+pw-browsers/
+smoke_test_result.json
+smoke_err.txt
+
+# Backend (chay tren may chu rieng)
+control_server/node_modules/
+control_server/.env
+control_server/logs/
+
+# Website
+website/node_modules/
+website/dist/
+
+# Local audit tooling
+.vibe-doctor/
