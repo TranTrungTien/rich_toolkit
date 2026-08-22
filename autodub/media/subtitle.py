@@ -166,6 +166,7 @@ def escape_subtitles_path(path: str) -> str:
     escaped = path.replace("\\", "/")
     escaped = escaped.replace(":", "\\:")
     escaped = escaped.replace("'", r"'\''")
+    escaped = escaped.replace("\n", "").replace("\r", "")
     return escaped
 
 

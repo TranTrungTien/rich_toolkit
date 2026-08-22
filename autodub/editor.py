@@ -583,6 +583,9 @@ def rebuild_output(
 
     state = load_work_dir(work_dir, target_key)
     target, segments = state.target, state.segments
+    if not segments:
+        raise EditorError("Dự án không có câu thoại nào để xuất.")
+
     subtitle_mode, blur_regions, style = _render_options(
         state, settings, subtitle_mode, blur_regions, subtitle_style)
 
@@ -781,6 +784,9 @@ def render_segment_preview(
     w0 = max(0.0, float(seg["start"]) - pad_s)
     w1 = max(float(seg["end"]),
              float(seg["start"]) + voice_dur) + pad_s
+    # Đảm bảo window đủ dài để chứa toàn bộ voice clip
+    if w1 - w0 < voice_dur + pad_s * 2:
+        w1 = w0 + voice_dur + pad_s * 2
 
     # Các câu chạm vào cửa sổ xem thử, mốc thời gian dời về 0 tại w0. Giọng
     # của câu tràn vào từ trước cửa sổ vẫn được trộn (mốc âm được
@@ -921,6 +927,18 @@ def _check_no_overlap(segments: list[dict], index: int,
                 "Hãy kéo mốc kết thúc sang trái, hoặc gộp hai câu lại.")
 
 
+def _check_no_overlap_all(segments: list[dict], exclude_index: int,
+                          start: float, end: float) -> None:
+    """Check overlap with all other segments."""
+    for i, seg in enumerate(segments):
+        if i == exclude_index:
+            continue
+        if float(seg["start"]) < end - _TIME_EPSILON and float(seg["end"]) > start + _TIME_EPSILON:
+            raise EditorError(
+                f"Câu này chồng lấn với câu số {seg.get('id')}. "
+                "Hãy điều chỉnh mốc thời gian.")
+
+
 def _renumber_and_rename(work_dir: str, segments: list[dict],
                          old_ids: list[int]) -> None:
     """Đánh lại số câu từ 1 tới N và đổi tên tệp giọng đọc cho khớp.
@@ -943,6 +961,15 @@ def _renumber_and_rename(work_dir: str, segments: list[dict],
 
 def _apply_renames(renames: list[tuple[str, str]]) -> None:
     """Đổi tên hàng loạt qua tên tạm, tránh hai tệp đè lên nhau giữa chừng."""
+    # Dọn file tạm cũ nếu lần trước crash giữa chừng
+    for source, target_path in renames:
+        tmp = target_path + ".doi_ten_tam"
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
     staged: list[tuple[str, str]] = []
     for source, target_path in renames:
         temporary = target_path + ".doi_ten_tam"
@@ -1119,7 +1146,7 @@ def merge_segments(work_dir: str, seg_ids: list[int],
     positions = [_index_of(segments, seg_id) for seg_id in ids]
     if positions != list(range(positions[0], positions[0] + len(positions))):
         raise EditorError(
-            "Chỉ gộp được những câu nằm liền nhau. Hãy chọn lại các câu "
+            "Ch chỉ gộp được những câu nằm liền nhau. Hãy chọn lại các câu "
             "kề nhau rồi thử lần nữa.")
 
     first, last = positions[0], positions[-1]
@@ -1155,7 +1182,7 @@ def set_segment_time(work_dir: str, seg_id: int, start: float, end: float,
     index = _index_of(segments, seg_id)
     start, end = float(start), float(end)
     _validate_times(start, end, f"Câu {seg_id}")
-    _check_no_overlap(segments, index, start, end)
+    _check_no_overlap_all(segments, index, start, end)
 
     segment = segments[index]
     if (abs(float(segment.get("start", 0.0)) - start) < _TIME_EPSILON

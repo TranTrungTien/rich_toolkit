@@ -303,8 +303,8 @@ class Settings:
             for k in (key, *aliases):
                 value = os.environ.get(k)
                 if value is not None:
-                    return value
-            return default
+                    return value.strip()
+            return default.strip()
 
         def env_int(key: str, default: str) -> int:
             try:

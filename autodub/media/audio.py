@@ -224,7 +224,7 @@ def slow_segments(
             failed, err = True, f"treo quá {_SEG_TIMEOUT_S}s"
         if failed:
             # Giữ nguyên tốc độ gốc còn hơn mất hẳn clip: các bước sau coi
-            # file thiếu là "segment missing" và video bị câm đoạn đó.
+            # file thiếu là "segment missing" and video bị câm đoạn đó.
             logger.error(f"atempo lỗi trên {os.path.basename(src)} — "
                          f"giữ tốc độ gốc ({err})")
             FALLBACKS.add("atempo_failed", seg["id"])
@@ -259,7 +259,7 @@ def postprocess_voice_clip(src: str, dst: str,
     if not dur or dur < 0.15:
         # Too short for loudnorm's analysis window (silence stubs etc.).
         if src != dst:
-            shutil.copyfile(src, dst)
+            shutil.copy2(src, dst)
         return False
     # loudnorm nội bộ chạy ở 192 kHz và GIỮ mức đó ở đầu ra nếu không ép
     # lại — file phình 8 lần và mọi bước sau chậm theo. Ép về rate gốc.
@@ -309,7 +309,7 @@ def postprocess_voice_clip(src: str, dst: str,
         if os.path.exists(tmp):
             os.remove(tmp)
         if src != dst:
-            shutil.copyfile(src, dst)
+            shutil.copy2(src, dst)
         return False
     os.replace(tmp, dst)
     return True
@@ -418,9 +418,12 @@ def _decode_resampled(path: str, rate: int, ch: int):
             capture_output=True, timeout=_SEG_TIMEOUT_S, check=False,
         )
         if result.returncode == 0 and result.stdout:
-            return (np.frombuffer(result.stdout, dtype=np.int16)
+            arr = (np.frombuffer(result.stdout, dtype=np.int16)
                     .astype(np.int32).reshape(-1, ch))
-    except (subprocess.TimeoutExpired, OSError):
+            if arr.size == 0:
+                raise ValueError("Empty decoded audio")
+            return arr
+    except (subprocess.TimeoutExpired, OSError, ValueError):
         pass
     logger.warning(f"ffmpeg decode lỗi trên {os.path.basename(path)} — "
                    "dùng pydub")
@@ -499,7 +502,7 @@ def merge_segments(
                 timeout=ffmpeg_timeout_s(total_duration),
                 check=False,
             )
-            ok = result.returncode == 0 and os.path.getsize(bg_tmp) > 0
+            ok = result.returncode == 0 and os.path.exists(bg_tmp) and os.path.getsize(bg_tmp) > 0
             err = result.stderr[:200] if not ok else ""
         except subprocess.TimeoutExpired:
             ok, err = False, "ffmpeg treo khi chuẩn hóa nhạc nền"
@@ -610,9 +613,9 @@ def _merge_segments_impl(
                     continue
                 block[gs - b0:ge - b0] += arr[gs - start_f:ge - start_f]
 
-                out.writeframes(
-                    np.clip(_soft_limit(block), -32768, 32767)
-                    .astype(np.int16).tobytes())
+            out.writeframes(
+                np.clip(_soft_limit(block), -32768, 32767)
+                .astype(np.int16).tobytes())
 
     if os.path.exists(bg_tmp):
         try:

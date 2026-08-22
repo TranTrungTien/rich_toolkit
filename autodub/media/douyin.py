@@ -59,7 +59,7 @@ def is_douyin_url(url: str) -> bool:
         return False
     url = url.strip()
     # Link share dán từ app thường thiếu scheme ("v.douyin.com/xxx") —
-    # urlparse khi đó trả netloc rỗng và link bị đẩy nhầm sang yt-dlp.
+    # urlparse khi đó trả netloc rỗng and link bị đẩy nhầm sang yt-dlp.
     if "://" not in url:
         url = "https://" + url
     host = urllib.parse.urlparse(url).netloc.lower()
@@ -266,6 +266,8 @@ def _extract_via_playwright(
             title = re.sub(r"\s*[-–]\s*抖音\s*$", "", title).strip()
             canonical = page.url
         finally:
+            if 'context' in locals():
+                context.close()
             browser.close()
 
     logger.info(

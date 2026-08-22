@@ -100,7 +100,7 @@ def plan_placements(
             next_natural = float(segments[i + 1]["start"])
             latest_end = next_natural + max_drift_s - min_gap_s
             available = latest_end - t
-            if 0 < available < dur:
+            if available > 0 and available < dur:
                 want = dur / available
                 if want >= _MIN_WORTHWHILE_ATEMPO:
                     atempo = min(max_atempo, want)

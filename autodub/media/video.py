@@ -1,7 +1,8 @@
 import json
 import os
 import subprocess
-from functools import cache, lru_cache
+import time
+from functools import cache
 
 from autodub.utils import ffmpeg_timeout_s, setup_logging
 
@@ -58,14 +59,27 @@ _HW_ENCODERS: tuple[tuple[str, list[str]], ...] = (
 )
 
 
-@lru_cache(maxsize=1)
+_encoder_cache = None
+_encoder_cache_time = 0
+ENCODER_CACHE_TTL = 300  # 5 phút
+
 def _resolve_encoder() -> tuple[str, tuple[str, ...]]:
     """Bộ mã hóa nhanh nhất máy này chạy được: (tên dễ đọc, argv)."""
+    global _encoder_cache, _encoder_cache_time
+    now = time.time()
+    if _encoder_cache is not None and (now - _encoder_cache_time) < ENCODER_CACHE_TTL:
+        return _encoder_cache
+
+    result = ("CPU (libx264)",
+              ("-c:v", "libx264", "-preset", "veryfast", "-crf", "20"))
     for name, args in _HW_ENCODERS:
         if _encoder_works(*args):
-            return name, tuple(args)
-    return ("CPU (libx264)",
-            ("-c:v", "libx264", "-preset", "veryfast", "-crf", "20"))
+            result = name, tuple(args)
+            break
+            
+    _encoder_cache = result
+    _encoder_cache_time = now
+    return result
 
 
 def video_codec_args() -> list[str]:
@@ -275,12 +289,14 @@ def merge_video(
         # thumbnail stream that would also be stream-copied.
         cmd += ["-c:v", "copy", "-map", "0:v:0", "-map", "1:a"]
 
-    if subtitle_mode == "soft":
-        # mov_text is the subtitle codec MP4 containers accept.
-        cmd += ["-map", "2:0", "-c:s", "mov_text",
-                "-metadata:s:s:0", f"language={subtitle_lang}"]
+    if filter_complex or subtitle_mode == "soft" or apply_speed:
+        # Re-encode audio
+        cmd += ["-c:a", "aac", "-b:a", "192k"]
+    else:
+        # Stream copy audio khi chỉ mux đơn giản
+        cmd += ["-c:a", "copy"]
 
-    cmd += ["-c:a", "aac", "-b:a", "192k", "-y", output_path]
+    cmd += ["-y", output_path]
 
     what = ["audio"]
     if subtitle_mode != "none":

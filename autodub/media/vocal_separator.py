@@ -103,7 +103,8 @@ class DemucsCache:
         t = threading.Thread(target=_read, daemon=True)
         t.start()
         t.join(timeout)
-        if t.is_alive() or not result or not result[0]:
+        if t.is_alive():
+            # Timeout thật → giết
             if self._proc is not None and self._proc.poll() is None:
                 try:
                     self._proc.kill()
@@ -111,6 +112,9 @@ class DemucsCache:
                     pass
                 t.join(2.0)
             raise RuntimeError("Demucs serve worker timed out or died")
+        if not result or not result[0]:
+            # Worker đã chết tự nhiên (EOF)
+            raise RuntimeError("Demucs serve worker exited unexpectedly")
         return result[0]
 
     def separate(self, input_wav: str, vocals_out: str, no_vocals_out: str,

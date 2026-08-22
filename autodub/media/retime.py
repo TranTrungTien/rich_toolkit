@@ -209,10 +209,12 @@ def apply_video_speed(
             os.remove(stale)
 
         new_duration = probe_duration(out_video)
+        if not new_duration:
+            logger.warning("Không đo được thời lượng video chậm, dùng tỷ lệ lý thuyết")
+            new_duration = orig_duration / speed
         # Measured ratio beats theoretical 1/speed: frame rounding shifts the
         # tail by a few ms and subs/audio must match the real file.
-        scale = (new_duration / orig_duration
-                 if new_duration and orig_duration else 1.0 / speed)
+        scale = new_duration / orig_duration if orig_duration else 1.0 / speed
 
         out_bg: str | None = None
         if background_path and os.path.exists(background_path):

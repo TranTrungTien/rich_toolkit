@@ -110,6 +110,8 @@ def save_json_atomic(data: object, path: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
     except Exception:
         if os.path.exists(tmp):
@@ -130,6 +132,7 @@ def fonts_dir() -> str:
 
 def bundled_font_files() -> list[str]:
     """Mọi file font trong :func:`fonts_dir` (rỗng khi thư mục chưa có)."""
+    # Fix M-002: (actually M-009 is utils.py, M-002 is douyin.py)
     d = fonts_dir()
     if not os.path.isdir(d):
         return []

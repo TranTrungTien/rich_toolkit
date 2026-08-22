@@ -140,6 +140,9 @@ class DubPipeline:
         # Work dir of the most recent run() call (set even when the run
         # fails mid-way) — batch uses it to resume the same folder later.
         self.last_work_dir = ""
+        self._hold_estimate = 0
+        from autodub.text.translate_common import HoldState
+        self._hold = HoldState()
 
     def _get_synth(self, target, voice):
         from autodub.speech.tts import get_synthesizer
@@ -341,17 +344,16 @@ class DubPipeline:
 
         tts_synth = None
         # Kiểu phụ đề chốt MỘT lần ở đây rồi dùng lại cho mọi bước sinh phụ
-        # đề bên dưới — chữ trong tệp .srt và chữ ghi vào hình luôn khớp.
+        # đề bên dưới — chữ trong tệp .srt and chữ ghi vào hình luôn khớp.
         from autodub.media.subtitle import normalize_style
         from autodub.text.subtitles import refresh_subtitles
-        from autodub.text.translate_common import HOLD
         subtitle_style = normalize_style(req.subtitle_style
                                          or settings.subtitle_style())
 
         def _refresh_subs(*args, **kwargs):
             # Hold chưa chốt → không để phụ đề (bản dịch thuần chữ) nằm
             # thường trên đĩa. Phase Xuất video sinh lại đầy đủ SRT/ASS.
-            if req.defer_export and HOLD.active:
+            if req.defer_export and self._hold.active:
                 return None, None
             return refresh_subtitles(*args, **kwargs)
 
@@ -389,13 +391,21 @@ class DubPipeline:
             overlap_ok = (req.bg_mode == "demucs"
                           and bool(gpu_venv_python())
                           and not asr_will_use_gpu(settings, lang_code))
+
+            def _bg_result():
+                try:
+                    return bg_future.result()
+                except Exception:  # noqa: BLE001
+                    # CancelledError hoặc lỗi khác → trả về (None, 0.0)
+                    return None, 0.0
+
             if overlap_ok:
                 logger.info("Demucs (GPU) và ASR (CPU) chạy song song — "
                             "tiết kiệm thời gian chờ")
             else:
                 # Let the separation finish first so Whisper gets the GPU
                 # alone (duck/none resolve instantly; a cached Demucs too).
-                bg_future.result()
+                _bg_result()
             logger.info("STEP 3: Transcribing audio (ASR)")
             logger.info("Đang nghe và ghi lại lời thoại trong video — "
                         "video dài thì bước này hơi lâu...")
@@ -433,7 +443,7 @@ class DubPipeline:
         blocked = self._setup_hold(segments, target, work_dir,
                                    video_duration_s)
         if blocked is not None:
-            bg_future.result()   # kết quả đã cache — lần chạy lại dùng ngay
+            _bg_result()   # kết quả đã cache — lần chạy lại dùng ngay
             return blocked
 
         # Khởi động sớm bộ giọng: việc nạp model (vài giây trên CPU) nấp sau
@@ -490,7 +500,7 @@ class DubPipeline:
                 rep.emit("translate", "start", detail=hint_path)
                 # Let the background separation finish before stopping: the
                 # result is cached on disk, so the resume run reuses it.
-                bg_future.result()
+                _bg_result()
                 # Don't hold TTS resources while waiting for a manual
                 # translation (cache-owned synths stay alive — the batch
                 # owner closes them).
@@ -503,11 +513,11 @@ class DubPipeline:
             # run hits the cached branch above (resume-safe, same as manual).
             from autodub.speech.transcriber import save_transcript
             save_transcript(translated, transcript_dub_path)
-            if HOLD.active:
+            if self._hold.active:
                 # Bản dịch trả phí — mã hóa trên đĩa cho tới khi commit hold.
                 from autodub import securestore
-                securestore.encrypt_file(transcript_dub_path, HOLD.key)
-                securestore.add_locked_file(work_dir, HOLD.hold_id,
+                securestore.encrypt_file(transcript_dub_path, self._hold.key)
+                securestore.add_locked_file(work_dir, self._hold.hold_id,
                                             transcript_dub_path)
             segments = self._load_translation(transcript_dub_path, segments, target)
             _refresh_subs(segments, work_dir, target, subtitle_style)
@@ -538,7 +548,7 @@ class DubPipeline:
         # One uniform factor: no per-segment fitting, no trimming ever.
         # Mutates segments onto the slowed timeline; on failure returns None
         # and the run continues on the original video.
-        background_path, background_gain_db = bg_future.result()
+        background_path, background_gain_db = _bg_result()
         deferred_speed: tuple[float, str] | None = None
         if settings.video_speed < 0.999 and not req.skip_video:
             rep.check_cancelled()
@@ -677,7 +687,7 @@ class DubPipeline:
             "elapsed_before": round(time.time() - start_time, 1),
         }
 
-        if req.defer_export and HOLD.active:
+        if req.defer_export and self._hold.active:
             return self._stop_for_export(export_state, work_dir)
 
         # Batch/legacy không có nút Xuất video — chốt hold NGAY TẠI ĐÂY (trước
@@ -689,7 +699,7 @@ class DubPipeline:
         try:
             return self._export_phase(export_state, work_dir, target)
         finally:
-            HOLD.clear()
+            self._hold.clear()
 
     def _stop_for_export(self, state: dict, work_dir: str) -> DubResult:
         """Dừng ở ranh giới Xuất video (luồng wizard, hold còn active).
@@ -702,9 +712,8 @@ class DubPipeline:
         from autodub import securestore
         from autodub.editor import load_render_opts, save_render_opts
         from autodub.speech.tts import voices as voice_catalog
-        from autodub.text.translate_common import HOLD
 
-        hold_id, key = HOLD.hold_id, HOLD.key
+        hold_id, key = self._hold.hold_id, self._hold.key
 
         # Ghim giọng + tùy chọn render để thẻ dự án hiện đúng thông tin
         # (Trình chỉnh sửa vẫn khóa cho tới khi xuất).
@@ -766,16 +775,16 @@ class DubPipeline:
         file trung gian đã mã hóa và đóng hold thay vì chờ sweeper 48 giờ.
         ``HOLD`` được GIỮ NGUYÊN — bước tạo nội dung đăng bài trong phase
         xuất còn trỏ vào hold này (server nhận hold committed cho đúng một
-        lượt generate_post); nơi gọi chịu trách nhiệm ``HOLD.clear()`` sau.
+        lượt generate_post); nơi gọi chịu trách nhiệm ``self._hold.clear()`` sau.
 
         Lỗi mạng ở đây KHÔNG làm hỏng lượt chạy — khóa còn trong RAM nên
         file trung gian vẫn mở được; hold sẽ tự chốt sau TTL, không tính
         thêm Vox.
         """
         from autodub import securestore
-        from autodub.text.translate_common import HOLD, USAGE
+        from autodub.text.translate_common import USAGE
 
-        hold_id, key = HOLD.hold_id, HOLD.key
+        hold_id, key = self._hold.hold_id, self._hold.key
         if not hold_id:
             return
         try:
@@ -974,6 +983,10 @@ class DubPipeline:
                 logger.info(f"Đã tự dọn tệp trung gian, giải phóng "
                             f"{freed / (1024 ** 2):.0f} MB.")
 
+        # Ghi marker export done
+        with open(os.path.join(work_dir, "export_done.json"), "w") as f:
+            json.dump({"done": True, "ts": time.time()}, f)
+
         rep.emit("done", "done", detail=work_dir)
         return DubResult(status="completed", work_dir=work_dir, report=report)
 
@@ -1000,7 +1013,7 @@ class DubPipeline:
         Trả về ``DubResult(status="credit_blocked")`` khi thiếu Vox (chặn
         TRƯỚC khi máy chạy tiếp), hoặc ``None`` để pipeline chạy tiếp:
 
-        - Hold tạo/nhận lại thành công → ``HOLD`` mang hold_id + khóa mã hóa,
+        - Hold tạo/nhận lại thành công → ``self._hold`` mang hold_id + khóa mã hóa,
           file trung gian mã hóa trên đĩa cho tới lúc xuất video.
         - Máy chủ tắt hold / hold đã chốt / không kết nối được → rơi về luồng
           cũ (trừ Vox theo từng lượt, không mã hóa) kèm cảnh báo.
@@ -1012,10 +1025,9 @@ class DubPipeline:
             get_client,
             is_configured,
         )
-        from autodub.text.translate_common import HOLD
         from autodub.text.translate_saas import run_id_for
 
-        HOLD.clear()
+        self._hold.clear()
         # Direct providers do not use VoxDub credits or holds.
         if self.settings.translate_provider != "voxdub":
             return None
@@ -1070,7 +1082,7 @@ class DubPipeline:
             logger.warning("Máy chủ không trả khóa mã hóa — trừ Vox theo "
                            "từng lượt như cũ")
             return None
-        HOLD.set(run_id, key)
+        self._hold.set(run_id, key)
 
         est = int(hold.get("estimatedVox") or 0)
         self._hold_estimate = est
@@ -1096,9 +1108,7 @@ class DubPipeline:
         cũ kèm khóa, mở được ``video_context.json`` và sổ tạm đã mã hóa,
         không bị tính phí lần hai.
         """
-        from autodub.text.translate_common import HOLD
-
-        if not HOLD.active:
+        if not self._hold.active:
             return ""
         est = int(getattr(self, "_hold_estimate", 0) or 0)
         if not est:
@@ -1323,8 +1333,7 @@ class DubPipeline:
             # File có thể đang mã hóa (hold chưa chốt) — read_json_secure tự
             # nhận biết; file thường đọc như open() bình thường.
             from autodub import securestore
-            from autodub.text.translate_common import HOLD
-            segments = securestore.read_json_secure(path, HOLD.key)
+            segments = securestore.read_json_secure(path, self._hold.key)
         except securestore.SecureStoreError as e:
             # File thường mà JSON hỏng → lỗi sửa-tay quen thuộc; chỉ file
             # đang mã hóa mới là chuyện khóa giải mã.
@@ -1364,7 +1373,7 @@ class DubPipeline:
         if missing:
             raise ValueError(
                 f"{path}: {len(missing)} segment(s) missing the '{target.text_field}' "
-                f"field (ids: {missing[:10]}{'...' if len(missing) > 10 else ''})"
+                f"field (ids: {missing[:10]}{'...' if len(bad_timing) > 10 else ''})"
             )
 
         if len(segments) != len(original_segments):
@@ -1969,7 +1978,7 @@ def export_committed_project(
     """
     from autodub import securestore
     from autodub.saas_client import get_client
-    from autodub.text.translate_common import HOLD, USAGE
+    from autodub.text.translate_common import USAGE
 
     lock = securestore.read_lock(work_dir)
     if not lock:
@@ -2012,18 +2021,18 @@ def export_committed_project(
     # GIỮ hold_id qua phase cuối: bước tạo nội dung đăng bài chạy SAU commit,
     # nhưng +20 Vox của gói tiêu đề + mô tả đã nằm trong giá hold — server
     # nhận hold committed cho đúng một lượt generate_post, không trừ ví thêm.
-    HOLD.set(hold_id, key)
     USAGE.reset()
     USAGE.add(charged, balance)  # thẻ tổng kết hiện đúng số Vox của video này
     FALLBACKS.reset()          # lượt dựng lại này tự đếm fallback của nó
 
     pipeline = DubPipeline(settings, progress=progress,
                            cancel_event=cancel_event)
+    pipeline._hold.set(hold_id, key)
     target = get_target(str(state.get("target") or "vi"))
     try:
         result = pipeline._export_phase(state, work_dir, target)
     finally:
-        HOLD.clear()           # hold đã xong việc — không rớt sang lượt sau
+        pipeline._hold.clear()           # hold đã xong việc — không rớt sang lượt sau
 
     # Trạng thái xuất đã dùng xong — dọn để marker/resume không hiểu nhầm.
     try:

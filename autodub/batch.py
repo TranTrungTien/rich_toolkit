@@ -91,11 +91,13 @@ class _Prefetcher:
         self._root = os.path.join(root_dir, "_prefetch")
         self._thread: threading.Thread | None = None
         self._result: dict = {}
+        self._stop_event = threading.Event()
 
     def start(self, index: int, item: BatchItem) -> None:
         """Bắt đầu tải nền cho ``item`` (bỏ qua nếu là file local)."""
         self._thread = None
         self._result = {}
+        self._stop_event.clear()
         if not item.url or item.file_path:
             return
         dest = os.path.join(self._root, str(index))
@@ -104,6 +106,7 @@ class _Prefetcher:
         def _work():
             try:
                 from autodub.media.downloader import download_video
+                # Truyền stop_event xuống downloader nếu hỗ trợ
                 result["path"] = download_video(item.url, dest)
             except Exception as e:  # noqa: BLE001 — video này sẽ tải lại bình thường
                 logger.warning(f"Tải trước thất bại ({item.label}): {e}")
@@ -115,13 +118,14 @@ class _Prefetcher:
         t.start()
         self._thread = t
 
-    def take(self, timeout: float = 3600.0) -> str | None:
+    def take(self, timeout: float = 60.0) -> str | None:
         """Chờ lượt tải nền xong; trả về đường dẫn file hoặc None."""
         t, self._thread = self._thread, None
         if t is None:
             return None
         t.join(timeout)
         if t.is_alive():
+            self._stop_event.set()
             logger.warning("Tải trước quá lâu — video sẽ tự tải lại")
             return None
         return self._result.get("path")
@@ -186,6 +190,9 @@ def parse_lines(text: str | Iterable[str]) -> list[BatchItem]:
             continue  # dòng chỉ có ký tự phân tách ("|", ",") — bỏ qua
         url = parts[0]
         voice = parts[1] if len(parts) > 1 else None
+        if voice and len(voice) > 100:
+            logger.warning(f"Tên giọng quá dài, cắt xuống 100 ký tự: {voice[:50]}...")
+            voice = voice[:100]
 
         if url in seen:
             logger.info(f"Skipping duplicate URL: {url}")
@@ -461,4 +468,3 @@ def run_batch(
             whisper_cache.close()
     summary.skipped = skipped
     return summary
-
