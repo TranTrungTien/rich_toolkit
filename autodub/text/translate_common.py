@@ -63,7 +63,7 @@ class UsageCounter:
 USAGE = UsageCounter()
 
 
-class HoldContext:
+class HoldState:
     """Hold Vox đang gắn với lượt chạy hiện tại (luồng wizard), đa luồng an toàn.
 
     Pipeline set trước bước dịch; mọi lượt gọi AI đọc ``hold_id`` từ đây để
@@ -103,7 +103,7 @@ class HoldContext:
 
 
 # Hold của lượt chạy hiện tại (rỗng ở luồng batch/legacy — mọi thứ như cũ).
-HOLD = HoldContext()
+HOLD = HoldState()
 
 
 def contains_cjk(text: str) -> bool:

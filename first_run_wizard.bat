@@ -19,7 +19,7 @@ echo ------------------------------------------------------------
 echo  Step 1: Choose Translation Provider
 echo ------------------------------------------------------------
 echo.
-echo   VoxDub supports three translation providers:
+echo   VoxDub supports four translation providers:
 echo.
 echo   1. VoxDub Cloud (Recommended)
 echo      - Centralized backend with optimized prompts
@@ -39,11 +39,17 @@ echo      - Flexible pricing and rate limits
 echo      - Requires: OPENROUTER_API_KEY
 echo      - Get key at: https://openrouter.ai/keys
 echo.
-set /p PROVIDER="  Choose provider (1/2/3) [1]: "
+echo   4. DeepSeek
+echo      - High performance, low cost
+echo      - Requires: DEEPSEEK_API_KEY
+echo      - Get key at: https://platform.deepseek.com/
+echo.
+set /p PROVIDER="  Choose provider (1/2/3/4) [1]: "
 if "!PROVIDER!"=="" set PROVIDER=1
+if "!PROVIDER!"=="1" set PROVIDER_NAME=voxdub
 if "!PROVIDER!"=="2" set PROVIDER_NAME=gemini
 if "!PROVIDER!"=="3" set PROVIDER_NAME=openrouter
-if "!PROVIDER!"=="1" set PROVIDER_NAME=voxdub
+if "!PROVIDER!"=="4" set PROVIDER_NAME=deepseek
 
 echo.
 echo   Selected: !PROVIDER_NAME!
@@ -76,6 +82,21 @@ if "!PROVIDER_NAME!"=="openrouter" (
     echo.
     set /p OR_MODEL="  OpenRouter model [google/gemini-2.0-flash-exp:free]: "
     if "!OR_MODEL!"=="" set OR_MODEL=google/gemini-2.0-flash-exp:free
+)
+
+if "!PROVIDER_NAME!"=="deepseek" (
+    echo.
+    echo ------------------------------------------------------------
+    echo  DeepSeek API Configuration
+    echo ------------------------------------------------------------
+    echo.
+    echo   Get your API key at:
+    echo     https://platform.deepseek.com/
+    echo.
+    set /p DEEPSEEK_KEY="  Enter your DeepSeek API key: "
+    echo.
+    set /p DEEPSEEK_MODEL="  DeepSeek model [deepseek-chat]: "
+    if "!DEEPSEEK_MODEL!"=="" set DEEPSEEK_MODEL=deepseek-chat
 )
 
 if "!PROVIDER_NAME!"=="voxdub" (
@@ -156,6 +177,14 @@ powershell -Command "(Get-Content .env) -replace '^QUALITY_PRESET=.*', 'QUALITY_
 
 if defined WHISPER_MODEL (
     powershell -Command "(Get-Content .env) -replace '^WHISPER_MODEL=.*', 'WHISPER_MODEL=!WHISPER_MODEL!' | Set-Content .env"
+)
+
+if defined DEEPSEEK_KEY (
+    powershell -Command "(Get-Content .env) -replace '^DEEPSEEK_API_KEY=.*', 'DEEPSEEK_API_KEY=!DEEPSEEK_KEY!' | Set-Content .env"
+)
+
+if defined DEEPSEEK_MODEL (
+    powershell -Command "(Get-Content .env) -replace '^DEEPSEEK_MODEL=.*', 'DEEPSEEK_MODEL=!DEEPSEEK_MODEL!' | Set-Content .env"
 )
 
 if defined GEMINI_KEY (

@@ -651,6 +651,7 @@ class NewProjectPage(BasePage):
             if part).strip()
         changes = {"voice_speed": data["voice_speed"],
                    "translate_enabled": bool(data["auto_translate"]),
+                   "translate_provider": data.get("translate_provider", settings.translate_provider),
                    "generate_metadata": bool(data["generate_metadata"])}
         if merged != settings.translate_style_notes:
             changes["translate_style_notes"] = merged
@@ -669,6 +670,8 @@ class NewProjectPage(BasePage):
         updates: dict[str, str] = {}
         if bool(data["auto_translate"]) != settings.translate_enabled:
             updates["TRANSLATE_ENABLED"] = bool_to_env(data["auto_translate"])
+        if data.get("translate_provider") and data["translate_provider"] != settings.translate_provider:
+            updates["TRANSLATE_PROVIDER"] = data["translate_provider"]
         if bool(data["generate_metadata"]) != settings.generate_metadata:
             updates["GENERATE_METADATA"] = bool_to_env(data["generate_metadata"])
         if not updates:

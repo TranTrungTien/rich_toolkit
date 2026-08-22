@@ -141,8 +141,8 @@ class DubPipeline:
         # fails mid-way) — batch uses it to resume the same folder later.
         self.last_work_dir = ""
         self._hold_estimate = 0
-        from autodub.text.translate_common import HoldState
-        self._hold = HoldState()
+        from autodub.text.translate_common import HOLD
+        self._hold = HOLD
 
     def _get_synth(self, target, voice):
         from autodub.speech.tts import get_synthesizer
@@ -321,7 +321,7 @@ class DubPipeline:
             if not overlap_ok:
                 try:
                     bg_future.result()
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     logger.debug(f"Background separation info: {e}")
 
             logger.info("STEP 3: Transcribing audio (ASR)")
@@ -364,10 +364,13 @@ class DubPipeline:
             from autodub.text.translate_hint import write_hint
             hint_path = write_hint(work_dir, target, source_lang, settings=self.settings, refund_note=self._money_note_for_manual())
             rep.emit("translate", "start", detail=hint_path)
-            try: bg_future.result()
-            except Exception: pass
-            if self._synth_cache is None and self._active_synth is not None:
-                if hasattr(self._active_synth, "close"): self._active_synth.close()
+            try:
+                bg_future.result()
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"Background separation skipped: {e}")
+            if (self._synth_cache is None and self._active_synth is not None
+                    and hasattr(self._active_synth, "close")):
+                self._active_synth.close()
             return DubResult(status="translate_pending", work_dir=work_dir)
 
         from autodub.speech.transcriber import save_transcript
@@ -390,8 +393,9 @@ class DubPipeline:
         seg_dir = ensure_dir(data_path(work_dir, "segments", create_dir=True))
         self._ensure_render_mode(work_dir, seg_dir)
         tts_results = self._synthesize_segments(target, voice, segments, seg_dir, synth=self._active_synth)
-        if self._synth_cache is None and self._active_synth is not None:
-            if hasattr(self._active_synth, "close"): self._active_synth.close()
+        if (self._synth_cache is None and self._active_synth is not None
+                and hasattr(self._active_synth, "close")):
+            self._active_synth.close()
         return tts_results
 
     def _step_retime(self, segments: list[dict], video_path: str, background_path: str,
@@ -402,7 +406,11 @@ class DubPipeline:
         if settings.video_speed < 0.999 and not req.skip_video:
             rep.check_cancelled()
             logger.info("=" * 60)
-            from autodub.media.retime import apply_video_speed, defer_video_speed, rescale_blur_regions
+            from autodub.media.retime import (
+                apply_video_speed,
+                defer_video_speed,
+                rescale_blur_regions,
+            )
             from autodub.text.subtitles import refresh_subtitles
             deferred = None
             if req.subtitle_mode == "burn" or req.blur_regions:
@@ -452,7 +460,7 @@ class DubPipeline:
             timing_report_dict = timing_report.to_dict() if timing_report else {}
             refresh_subtitles(segments, work_dir, target, subtitle_style)
 
-        from autodub.media.audio import wav_duration_s, merge_segments
+        from autodub.media.audio import merge_segments, wav_duration_s
         from autodub.media.video import probe_duration_s
         total_duration = max(seg["end"] for seg in segments) + 1.0 if segments else 0
         for seg in segments:
@@ -475,7 +483,6 @@ class DubPipeline:
     def _run_impl(self, req: DubRequest) -> DubResult:
         start_time = time.time()
         settings = self.settings
-        rep = self._reporter
         target = get_target(req.target)
         lang_code = resolve_source_lang(req.source_lang)
 
@@ -508,8 +515,10 @@ class DubPipeline:
         video_duration_s = max(float(s.get("end", 0) or 0) for s in segments)
         blocked = self._setup_hold(segments, target, work_dir, video_duration_s)
         if blocked is not None:
-            try: bg_future.result()
-            except Exception: pass
+            try:
+                bg_future.result()
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"Background separation skipped for block: {e}")
             return blocked
 
         # TTS Early Warm-up
@@ -517,7 +526,7 @@ class DubPipeline:
             self._active_synth = self._get_synth(target, req.voice)
             warm = getattr(self._active_synth, "warm_up_async", None)
             if warm: warm()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning(f"Bỏ qua khởi động sớm bộ giọng ({e})")
 
         # Step 4: Translate
@@ -530,8 +539,11 @@ class DubPipeline:
         tts_results = self._step_tts(segments, target, req.voice, work_dir)
 
         def _bg_result():
-            try: return bg_future.result()
-            except Exception: return None, 0.0
+            try:
+                return bg_future.result()
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"Background result failed: {e}")
+                return None, 0.0
 
         # Step 5.5: Retime Video
         background_path, background_gain_db = _bg_result()

@@ -326,22 +326,22 @@ class TranslateStep(_StepPanel):
             "Phong cách dịch",
             [(label, key) for label, key, _note in consts.TRANSLATE_STYLES],
             "Quyết định giọng văn của bản dịch, ví dụ trang trọng hay đời thường.")
-        self._engine_label = QLabel("Đang tải...")
-        self._engine_label.setStyleSheet(
-            f"color: {tokens.TEXT_PRIMARY}; font-size: {tokens.FS_BODY}px; "
-            f"font-weight: 600; background: {tokens.BG_INPUT}; "
-            f"border-radius: 8px; padding: 8px 12px;")
-        self.engine_row = LabeledWidget(
-            "Dịch bằng", self._engine_label,
-            "Nhà cung cấp dịch vụ AI bạn đã chọn trong Cài đặt.")
+
+        from autodub_gui.pages.settings_fields import FIELDS
+        provider_field = next(f for f in FIELDS if f.key == "TRANSLATE_PROVIDER")
+        self.engine = LabeledCombo(
+            "Dịch bằng", provider_field.options,
+            "Nhà cung cấp dịch vụ AI. Bạn có thể đổi và cấu hình API Key trong trang Dịch thuật.")
+
         self.note = LabeledLineEdit(
             "Ghi chú thêm cho người dịch",
             "ví dụ: giữ tên nhân vật Hán Việt, xưng hô mình với các bạn",
             "Ghi chú này được gửi kèm mỗi lần dịch.")
         self.style.changed.connect(self.changed.emit)
+        self.engine.changed.connect(self._on_engine_changed)
         self.note.changed.connect(lambda _t: self.changed.emit())
         self.body.addWidget(self.style)
-        self.body.addWidget(self.engine_row)
+        self.body.addWidget(self.engine)
         self.body.addWidget(self.note)
 
         self.manual_note = QLabel(
@@ -360,26 +360,32 @@ class TranslateStep(_StepPanel):
         """Cập nhật tên nhà cung cấp và nhãn nút bấm theo Cài đặt."""
         try:
             from autodub.config import Settings
-            settings = Settings.load()
+            settings = Settings.load(override=True)
             provider = settings.translate_provider.lower()
-            names = {"voxdub": "VoxDub Cloud", "gemini": "Google Gemini",
-                     "openrouter": "OpenRouter", "deepseek": "DeepSeek"}
-            name = names.get(provider, provider.capitalize())
-            self._engine_label.setText(name)
-
-            if provider == "voxdub":
-                self.auto_translate.setText("Dịch tự động")
-                self.metadata.setText("Tạo tiêu đề + mô tả đăng bài")
-                self.engine_row.setToolTip(
-                    "Máy chủ VoxDub tự chọn mô hình tốt nhất — bạn không phải "
-                    "cấu hình gì.")
-            else:
-                self.auto_translate.setText(f"Dịch tự động ({name})")
-                self.metadata.setText("Tạo tiêu đề + mô tả đăng bài")
-                self.engine_row.setToolTip(
-                    f"Sử dụng API {name} trực tiếp với API Key của bạn.")
+            self.engine.set_key(provider)
+            self._update_ui_for_provider(provider)
         except Exception:  # noqa: BLE001, S110
             pass
+
+    def _on_engine_changed(self) -> None:
+        provider = self.engine.current_key()
+        self._update_ui_for_provider(provider)
+        self.changed.emit()
+
+    def _update_ui_for_provider(self, provider: str) -> None:
+        names = {"voxdub": "VoxDub Cloud", "gemini": "Google Gemini",
+                 "openrouter": "OpenRouter", "deepseek": "DeepSeek"}
+        name = names.get(provider, provider.capitalize())
+
+        if provider == "voxdub":
+            self.auto_translate.setText("Dịch tự động")
+            self.engine.setToolTip(
+                "Máy chủ VoxDub tự chọn mô hình tốt nhất — bạn không phải "
+                "cấu hình gì.")
+        else:
+            self.auto_translate.setText(f"Dịch tự động ({name})")
+            self.engine.setToolTip(
+                f"Sử dụng API {name} trực tiếp với API Key của bạn.")
 
     def showEvent(self, event) -> None:
         self._refresh_engine()
@@ -388,7 +394,7 @@ class TranslateStep(_StepPanel):
     def _on_auto_translate(self, checked: bool) -> None:
         # Tắt dịch tự động thì phong cách và ghi chú không được gửi đi đâu
         # cả — mờ chúng đi cho khỏi gây hiểu lầm.
-        for widget in (self.style, self.engine_row, self.note):
+        for widget in (self.style, self.engine, self.note):
             widget.setEnabled(checked)
         self.manual_note.setVisible(not checked)
         self.changed.emit()
@@ -399,6 +405,7 @@ class TranslateStep(_StepPanel):
     def values(self) -> dict:
         return {
             "auto_translate": self.auto_translate.isChecked(),
+            "translate_provider": self.engine.current_key(),
             "generate_metadata": self.metadata.isChecked(),
             "translate_style": self.style.current_key(),
             "translate_note": self.note.text(),
