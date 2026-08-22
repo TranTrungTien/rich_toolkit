@@ -51,7 +51,7 @@ def normalize_url(url: str) -> str:
     return url
 
 
-def download_video(url: str, output_dir: str) -> str:
+def download_video(url: str, output_dir: str, stop_event=None) -> str:
     if not url:
         raise ValueError("URL cannot be empty")
 
@@ -63,13 +63,17 @@ def download_video(url: str, output_dir: str) -> str:
     from autodub.media.douyin import download_douyin, is_douyin_url
     if is_douyin_url(url):
         logger.info(f"Routing to Playwright Douyin extractor: {url}")
-        info = download_douyin(url, output_dir)
+        info = download_douyin(url, output_dir, stop_event=stop_event)
         _save_meta(output_dir, info.get("title", ""), info.get("uploader", ""))
         return info["filepath"]
 
     canonical = normalize_url(url)
     if canonical != url:
         logger.info(f"Normalized URL: {url} -> {canonical}")
+
+    def _check_cancel(d):
+        if stop_event and stop_event.is_set():
+            raise RuntimeError("Download cancelled by user")
 
     ydl_opts = {
         "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
@@ -81,6 +85,7 @@ def download_video(url: str, output_dir: str) -> str:
         "retries": 5,
         "fragment_retries": 5,
         "socket_timeout": 30,
+        "progress_hooks": [_check_cancel],
     }
 
     logger.info(f"Downloading video from: {canonical}")

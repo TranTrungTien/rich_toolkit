@@ -26,8 +26,9 @@ class FallbackCounter:
     """
 
     def __init__(self) -> None:
+        from collections import defaultdict
         self._lock = threading.Lock()
-        self._events: dict[str, list] = {}
+        self._events: dict[str, list] = defaultdict(list)
 
     def reset (self) -> None:
         with self._lock:
@@ -35,7 +36,7 @@ class FallbackCounter:
 
     def add(self, kind: str, seg_id) -> None:
         with self._lock:
-            self._events.setdefault(kind, []).append(seg_id)
+            self._events[kind].append(seg_id)
 
     def snapshot(self) -> dict[str, list]:
         with self._lock:
@@ -156,12 +157,14 @@ def extract_audio_dual(video_path: str, asr_path: str, hq_path: str,
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video not found: {video_path}")
 
+    asr_tmp = asr_path + ".dual.tmp.wav"
+    hq_tmp = hq_path + ".dual.tmp.wav"
     cmd = [
         "ffmpeg", "-y", "-i", video_path,
         "-vn", "-ar", str(asr_rate), "-ac", "1", "-acodec", "pcm_s16le",
-        asr_path,
+        asr_tmp,
         "-vn", "-ar", "44100", "-ac", "2", "-acodec", "pcm_s16le",
-        hq_path,
+        hq_tmp,
     ]
     logger.info(f"Extracting audio (1 pass, 2 outputs): {video_path}")
     try:
@@ -169,11 +172,21 @@ def extract_audio_dual(video_path: str, asr_path: str, hq_path: str,
                                 timeout=ffmpeg_timeout_s(None), check=False)
     except subprocess.TimeoutExpired:
         result = None
+
     ok = (result is not None and result.returncode == 0
-          and os.path.exists(asr_path) and os.path.getsize(asr_path) > 0
-          and os.path.exists(hq_path) and os.path.getsize(hq_path) > 0)
+          and os.path.exists(asr_tmp) and os.path.getsize(asr_tmp) > 0
+          and os.path.exists(hq_tmp) and os.path.getsize(hq_tmp) > 0)
+
+    if ok:
+        try:
+            os.replace(asr_tmp, asr_path)
+            os.replace(hq_tmp, hq_path)
+        except OSError as e:
+            logger.error(f"Failed to move dual extract outputs: {e}")
+            ok = False
+
     if not ok:
-        for p in (asr_path, hq_path):
+        for p in (asr_tmp, hq_tmp):
             if os.path.exists(p):
                 os.remove(p)
         err = ("ffmpeg treo" if result is None else result.stderr[:200])
@@ -229,6 +242,9 @@ def slow_segments(
                          f"giữ tốc độ gốc ({err})")
             FALLBACKS.add("atempo_failed", seg["id"])
             shutil.copyfile(src, dst)
+        else:
+            # Set mtime to now to ensure strictly newer than source for future resumes
+            os.utime(dst, None)
 
     with ThreadPoolExecutor(max_workers=max_workers or _FFMPEG_WORKERS) as pool:
         list(pool.map(_slow_one, segments))
@@ -265,10 +281,10 @@ def postprocess_voice_clip(src: str, dst: str,
     # lại — file phình 8 lần và mọi bước sau chậm theo. Ép về rate gốc.
     src_rate = 24000
     try:
-        import wave as _wave
-        with _wave.open(src, "rb") as w:
-            src_rate = w.getframerate()
-    except (OSError, EOFError):
+        from pydub.utils import mediainfo
+        info = mediainfo(src)
+        src_rate = int(info.get("sample_rate", 24000))
+    except (OSError, ValueError, TypeError):
         pass
     fade_s = _VOICE_FADE_MS / 1000.0
     # atempo gộp luôn vào đây: mỗi câu chỉ còn MỘT lệnh ffmpeg thay vì hai
@@ -577,10 +593,10 @@ def _merge_segments_impl(
             n = b1 - b0
             if bg_wave is not None:
                 raw = bg_wave.readframes(n)
+                expected = n * ch * 2
+                if len(raw) < expected:
+                    raw = raw + b'\x00' * (expected - len(raw))
                 block = np.frombuffer(raw, dtype=np.int16).astype(np.int32)
-                if len(block) < n * ch:   # background shorter than expected
-                    block = np.concatenate(
-                        [block, np.zeros(n * ch - len(block), dtype=np.int32)])
                 block = block.reshape(-1, ch)
                 if duck_intervals:
                     env = _duck_envelope(n, b0, rate, duck_intervals,

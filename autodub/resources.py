@@ -27,9 +27,40 @@ _CPU = os.cpu_count() or 4
 #: chung cho MỌI pool thay vì trần riêng của từng pool — nên các call site
 #: truyền ``min(8, parallel_workers)`` không còn cộng dồn lên được nữa.
 #:
-#: BoundedSemaphore (không phải Semaphore) để release lệch nhịp báo lỗi ngay
-#: thay vì âm thầm nới trần.
-FFMPEG_SLOTS = threading.BoundedSemaphore(max(2, min(6, _CPU - 1)))
+class ReentrantFFmpegSlots:
+    """Semaphore that allows the same thread to acquire multiple times.
+
+    BoundedSemaphore is not reentrant: acquiring twice in the same thread
+    deadlocks. This wrapper uses thread-local storage to track reentrancy.
+    """
+
+    def __init__(self, max_workers: int):
+        self._sem = threading.Semaphore(max_workers)
+        self._local = threading.local()
+
+    def acquire(self):
+        if getattr(self._local, "count", 0) > 0:
+            self._local.count += 1
+            return
+        self._sem.acquire()
+        self._local.count = 1
+
+    def release(self):
+        if getattr(self._local, "count", 0) > 1:
+            self._local.count -= 1
+            return
+        self._sem.release()
+        self._local.count = 0
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *args):
+        self.release()
+
+
+FFMPEG_SLOTS = ReentrantFFmpegSlots(max(2, min(6, _CPU - 1)))
 
 #: Giữ khi dùng GPU: nhánh Demucs GPU và lúc nạp model Whisper trên CUDA.
 #: Cổng sẵn có trong pipeline chỉ là *dự đoán* xem ASR có dùng GPU không; lock

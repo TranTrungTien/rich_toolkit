@@ -98,7 +98,13 @@ class DemucsCache:
         result: list[str] = []
 
         def _read() -> None:
-            result.append(self._proc.stdout.readline())
+            # Lọc cho tới khi thấy dòng JSON để tránh warning từ library
+            # in ra stdout làm hỏng json.loads.
+            for line in iter(self._proc.stdout.readline, ""):
+                line = line.strip()
+                if line.startswith("{"):
+                    result.append(line)
+                    break
 
         t = threading.Thread(target=_read, daemon=True)
         t.start()

@@ -106,8 +106,8 @@ class _Prefetcher:
         def _work():
             try:
                 from autodub.media.downloader import download_video
-                # Truyền stop_event xuống downloader nếu hỗ trợ
-                result["path"] = download_video(item.url, dest)
+                # Truyền stop_event xuống downloader
+                result["path"] = download_video(item.url, dest, stop_event=self._stop_event)
             except Exception as e:  # noqa: BLE001 — video này sẽ tải lại bình thường
                 logger.warning(f"Tải trước thất bại ({item.label}): {e}")
                 result["error"] = str(e)

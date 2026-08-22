@@ -222,26 +222,7 @@ class DubPipeline:
         except Exception as exc:  # noqa: BLE001 — ffmpeg lạ — không đáng làm hỏng lượt chạy
             logger.debug(f"Không dò được encoder: {exc}")
 
-    def _run_impl(self, req: DubRequest) -> DubResult:
-        start_time = time.time()
-        settings = self.settings
-        rep = self._reporter
-        # Ghi nhận thời gian từng bước để dễ phát hiện điểm nghẽn hiệu năng.
-        stage_times: dict[str, float] = {}
-        _stage_start: list[float] = [start_time]
-
-        def _tick(name: str) -> None:
-            now = time.time()
-            stage_times[name] = round(now - _stage_start[0], 2)
-            _stage_start[0] = now
-            logger.info(f"  ⏱  {name}: {stage_times[name]:.1f}s")
-
-        target = get_target(req.target)
-        lang_code = resolve_source_lang(req.source_lang)
-        logger.info(f"Source language: {lang_code} → {target.name}")
-        self._log_machine_info(settings)
-
-        # Resume an existing work_dir or create a new timestamped one
+    def _init_work_dir(self, req: DubRequest, target: TargetLang) -> tuple[str, str, str, str, str]:
         if req.resume_dir:
             if not os.path.isdir(req.resume_dir):
                 raise FileNotFoundError(f"Resume directory not found: {req.resume_dir}")
@@ -253,22 +234,16 @@ class DubPipeline:
             folder_name = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S") + target.folder_suffix
             work_dir = ensure_dir(os.path.join(output_dir, folder_name))
             logger.info(f"Output folder: {work_dir}")
-        # Cho caller (batch) biết lượt chạy này nằm ở thư mục nào — kể cả khi
-        # nó đổ giữa chừng, để lần chạy lại truyền resume_dir đúng chỗ.
-        self.last_work_dir = work_dir
 
-        # Bố cục thư mục: file kỹ thuật vào data/, kết quả nằm ở gốc.
-        # Thư mục cũ (mọi thứ phẳng ở gốc) được data_path tự nhận và giữ nguyên.
-        transcript_orig_path = data_path(work_dir, "transcript_original.json",
-                                         create_dir=True)
+        self.last_work_dir = work_dir
+        transcript_orig_path = data_path(work_dir, "transcript_original.json", create_dir=True)
         transcript_dub_path = data_path(work_dir, target.transcript_name)
         audio_path = data_path(work_dir, "original_audio.wav")
+        return work_dir, folder_name, transcript_orig_path, transcript_dub_path, audio_path
 
-        # --- Step 1: Download or use local file ---
+    def _step_acquire_video(self, req: DubRequest, work_dir: str) -> str:
+        rep = self._reporter
         rep.check_cancelled()
-        # detail = work_dir: báo sớm cho GUI biết thư mục dự án của lượt chạy
-        # này — lỡ có lỗi giữa chừng thì trang Tạo dự án còn biết chỗ mà mời
-        # người dùng chạy tiếp (tránh tạo dự án mới, tránh trừ Vox hai lần).
         rep.emit("acquire", "start", detail=work_dir)
         logger.info("=" * 60)
         logger.info("STEP 1: Acquiring video")
@@ -276,23 +251,19 @@ class DubPipeline:
             logger.info("Đang tải video về máy...")
         video_path = self._resolve_video(work_dir, req.url, req.file_path)
         logger.info(f"Video: {video_path}")
-        logger.info(f"Đã có video: {os.path.basename(video_path)}")
         rep.emit("acquire", "done", detail=video_path)
-        _tick("acquire")
+        return video_path
 
-        # --- Step 2: Extract audio ---
+    def _step_extract_audio(self, video_path: str, work_dir: str, audio_path: str) -> str:
+        settings = self.settings
+        rep = self._reporter
         rep.check_cancelled()
         logger.info("=" * 60)
-        # HQ extract for the background/mix path: 44.1 kHz stereo. The 16 kHz
-        # mono file is what ASR wants, but running Demucs on it crushes the
-        # soundtrack to phone-call bandwidth — the single biggest audio
-        # quality loss of the old pipeline. Failure falls back to the ASR wav.
         hq_audio_path = data_path(work_dir, "original_audio_hq.wav")
-        have_asr = (os.path.exists(audio_path)
-                    and os.path.getsize(audio_path) > 0)
-        have_hq = (os.path.exists(hq_audio_path)
-                   and os.path.getsize(hq_audio_path) > 0)
+        have_asr = os.path.exists(audio_path) and os.path.getsize(audio_path) > 0
+        have_hq = os.path.exists(hq_audio_path) and os.path.getsize(hq_audio_path) > 0
         need_hq = settings.hq_background and not have_hq
+
         if have_asr:
             logger.info(f"STEP 2: Reusing existing extracted audio: {audio_path}")
             rep.emit("extract", "skip", detail=audio_path)
@@ -301,400 +272,289 @@ class DubPipeline:
             rep.emit("extract", "start")
             from autodub.media.audio import extract_audio, extract_audio_dual
             if need_hq:
-                # Cần cả hai bản — một lệnh ffmpeg, video giải mã một lần.
                 try:
                     extract_audio_dual(video_path, audio_path, hq_audio_path,
                                        asr_rate=settings.audio_sample_rate)
                     need_hq = False
                 except Exception as e:  # noqa: BLE001
-                    logger.warning(f"Rút audio 1 lượt lỗi ({e}) — "
-                                   "tách thành hai lệnh rời")
-            if not (os.path.exists(audio_path)
-                    and os.path.getsize(audio_path) > 0):
-                extract_audio(video_path, audio_path,
-                              sample_rate=settings.audio_sample_rate)
+                    logger.warning(f"Rút audio 1 lượt lỗi ({e}) — tách thành hai lệnh rời")
+            if not (os.path.exists(audio_path) and os.path.getsize(audio_path) > 0):
+                extract_audio(video_path, audio_path, sample_rate=settings.audio_sample_rate)
             rep.emit("extract", "done", detail=audio_path)
+
         if settings.hq_background:
             if need_hq:
                 try:
                     from autodub.media.audio import extract_audio
-                    extract_audio(video_path, hq_audio_path,
-                                  sample_rate=44100, channels=2)
+                    extract_audio(video_path, hq_audio_path, sample_rate=44100, channels=2)
                 except Exception as e:  # noqa: BLE001
-                    logger.warning(f"Không rút được audio HQ ({e}) — "
-                                   "nhạc nền dùng bản 16 kHz như cũ")
+                    logger.warning(f"Không rút được audio HQ ({e}) — nhạc nền dùng bản 16 kHz")
                     hq_audio_path = audio_path
         else:
             hq_audio_path = audio_path
+        return hq_audio_path
 
-        # --- Step 2.5: Background track — starts right after the audio
-        # extract. The pipeline waits for it BEFORE ASR: Demucs and Whisper
-        # sharing a 6 GB GPU slow each other down more than running back to
-        # back, and each step alone peaks lower on RAM/VRAM.
-        rep.check_cancelled()
-        from concurrent.futures import ThreadPoolExecutor
-        bg_executor = ThreadPoolExecutor(max_workers=1)
-        bg_future = bg_executor.submit(
-            self._resolve_background, req.bg_mode, req.bg_duck_db,
-            hq_audio_path, work_dir,
-        )
-        # Giữ trên self, shutdown trong finally của run() — xem chú thích ở đó.
-        self._bg_executor = bg_executor
-        self._active_bg_future = bg_future
-
-        tts_synth = None
-        # Kiểu phụ đề chốt MỘT lần ở đây rồi dùng lại cho mọi bước sinh phụ
-        # đề bên dưới — chữ trong tệp .srt and chữ ghi vào hình luôn khớp.
-        from autodub.media.subtitle import normalize_style
-        from autodub.text.subtitles import refresh_subtitles
-        subtitle_style = normalize_style(req.subtitle_style
-                                         or settings.subtitle_style())
-
-        def _refresh_subs(*args, **kwargs):
-            # Hold chưa chốt → không để phụ đề (bản dịch thuần chữ) nằm
-            # thường trên đĩa. Phase Xuất video sinh lại đầy đủ SRT/ASS.
-            if req.defer_export and self._hold.active:
-                return None, None
-            return refresh_subtitles(*args, **kwargs)
-
-        # --- Step 3: Speech-to-Text (ASR) — GPU-exclusive ---
+    def _step_asr(self, audio_path: str, lang_code: str, work_dir: str,
+                  transcript_orig_path: str, bg_future) -> list[dict]:
+        settings = self.settings
+        rep = self._reporter
         rep.check_cancelled()
         logger.info("=" * 60)
         segments = None
         if os.path.exists(transcript_orig_path):
-            # Validate khi resume: file hỏng (crash giữa chừng ở bản cũ,
-            # disk full...) thì nghe lại thay vì sập cả pipeline.
             try:
                 with open(transcript_orig_path, encoding="utf-8") as f:
                     cached_segments = json.load(f)
-                if not (isinstance(cached_segments, list)
-                        and all(isinstance(s, dict) and "start" in s
-                                and "end" in s and "text" in s
-                                for s in cached_segments)):
+                if not (isinstance(cached_segments, list) and all(isinstance(s, dict) and "start" in s for s in cached_segments)):
                     raise ValueError("transcript thiếu trường bắt buộc")
                 segments = cached_segments
                 logger.info(f"STEP 3: Reusing existing transcript: {transcript_orig_path}")
-                logger.info(f"Dùng lại lời thoại đã nghe từ lần chạy trước "
-                            f"({len(segments)} câu) — đỡ chờ")
                 rep.emit("asr", "skip", detail=f"{len(segments)} segments (cached)")
             except (ValueError, json.JSONDecodeError, OSError) as e:
                 logger.warning(f"Transcript cũ hỏng ({e}) — nghe lại từ đầu")
-                segments = None
+
         if segments is None:
-            # Demucs và ASR chỉ được chạy song song khi KHÔNG giành nhau
-            # tài nguyên: Demucs trong tiến trình con GPU còn ASR chắc chắn
-            # chạy CPU (Paraformer, hoặc Whisper không nạp được CUDA).
-            # Còn lại giữ rào chắn cũ — hai việc nặng chen nhau trên cùng
-            # GPU (hoặc cùng 4 nhân CPU) chậm hơn chạy lần lượt.
             from autodub.media.vocal_separator import gpu_venv_python
             from autodub.speech.transcriber import asr_will_use_gpu
-            overlap_ok = (req.bg_mode == "demucs"
-                          and bool(gpu_venv_python())
-                          and not asr_will_use_gpu(settings, lang_code))
+            overlap_ok = (self._bg_executor is not None and bool(gpu_venv_python()) and not asr_will_use_gpu(settings, lang_code))
 
-            def _bg_result():
+            if not overlap_ok:
                 try:
-                    return bg_future.result()
-                except Exception:  # noqa: BLE001
-                    # CancelledError hoặc lỗi khác → trả về (None, 0.0)
-                    return None, 0.0
+                    bg_future.result()
+                except Exception as e:
+                    logger.debug(f"Background separation info: {e}")
 
-            if overlap_ok:
-                logger.info("Demucs (GPU) và ASR (CPU) chạy song song — "
-                            "tiết kiệm thời gian chờ")
-            else:
-                # Let the separation finish first so Whisper gets the GPU
-                # alone (duck/none resolve instantly; a cached Demucs too).
-                _bg_result()
             logger.info("STEP 3: Transcribing audio (ASR)")
-            logger.info("Đang nghe và ghi lại lời thoại trong video — "
-                        "video dài thì bước này hơi lâu...")
             rep.emit("asr", "start")
             from autodub.speech.transcriber import save_transcript, transcribe
             from autodub.text.srt import generate_srt
-            segments = transcribe(audio_path, lang_code, settings,
-                                  whisper_cache=self._whisper_cache)
+            segments = transcribe(audio_path, lang_code, settings, whisper_cache=self._whisper_cache)
             save_transcript(segments, transcript_orig_path)
-            generate_srt(segments, data_path(work_dir, "transcript_original.srt"),
-                         text_field="text")
-            logger.info(f"Nghe xong: video có {len(segments)} câu thoại")
+            generate_srt(segments, data_path(work_dir, "transcript_original.srt"), text_field="text")
             rep.emit("asr", "done", detail=f"{len(segments)} segments")
-        logger.info(f"Transcribed {len(segments)} segments")
+
         if not segments:
-            # Không có lời nói → dịch/TTS đều vô nghĩa; báo đúng nguyên nhân
-            # thay vì để bước dịch fail với thông điệp gây hiểu nhầm.
-            raise RuntimeError(
-                "Không nhận dạng được lời nói nào trong video (video chỉ có "
-                "nhạc, hoặc chọn sai ngôn ngữ gốc). Kiểm tra lại ngôn ngữ "
-                "nguồn trong tab Lồng tiếng.")
+            raise RuntimeError("Không nhận dạng được lời nói nào trong video.")
+        return segments
 
-        # Real per-clip time window (until the next line starts) — drives the
-        # translation character budget and the TTS target duration.
-        from autodub.text.translate_hint import annotate_slots
-        annotate_slots(segments)
-
-        # --- Giữ chỗ Vox — sau ASR là lúc biết chính xác số câu và thời
-        # lượng. MỌI lượt chạy đều giữ chỗ (wizard lẫn batch) nên giá luôn là
-        # công thức đóng trên số segment. Thiếu Vox thì chặn NGAY TẠI ĐÂY,
-        # trước khi máy chủ tốn một đồng phí AI nào. Khác biệt duy nhất giữa
-        # hai luồng là THỜI ĐIỂM chốt: wizard dừng chờ bấm Xuất video, còn
-        # batch/legacy chốt ngay sau khi xuất xong (xem cuối hàm).
-        video_duration_s = max(float(s.get("end", 0) or 0) for s in segments)
-        blocked = self._setup_hold(segments, target, work_dir,
-                                   video_duration_s)
-        if blocked is not None:
-            _bg_result()   # kết quả đã cache — lần chạy lại dùng ngay
-            return blocked
-
-        # Khởi động sớm bộ giọng: việc nạp model (vài giây trên CPU) nấp sau
-        # bước dịch. VieNeu chạy CPU nên không tranh card đồ họa với bất cứ
-        # thứ gì — lúc nào cũng khởi động sớm được. Ở đây chỉ NẠP model, còn
-        # việc tạo giọng vẫn nằm nguyên trong Bước 5.
-        try:
-            tts_synth = self._get_synth(target, req.voice)
-            self._active_synth = tts_synth
-            warm = getattr(tts_synth, "warm_up_async", None)
-            if warm is not None:
-                # A3 fix: khởi động worker ngay lập tức thay vì chờ Demucs.
-                # VieNeu chạy CPU-only — không tranh VRAM với Demucs (GPU),
-                # nên có thể load song song và tiết kiệm 30-120s chờ đợi.
-                warm()
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"Bỏ qua khởi động sớm bộ giọng ({e})")
-            tts_synth = None
-            self._active_synth = None
-
-        # --- Step 4: Load translation (manual via skill or web AI) ---
+    def _step_translate(self, segments: list[dict], target: TargetLang, source_lang: str,
+                        work_dir: str, transcript_dub_path: str, subtitle_style: dict,
+                        req: DubRequest, bg_future) -> list[dict] | DubResult:
+        rep = self._reporter
         rep.check_cancelled()
         logger.info("=" * 60)
         logger.info(f"STEP 4: Loading {target.name} translation")
+        from autodub.text.subtitles import refresh_subtitles
+
+        def _refresh_subs(segs):
+            if req.defer_export and self._hold.active: return None, None
+            return refresh_subtitles(segs, work_dir, target, subtitle_style)
+
         if os.path.exists(transcript_dub_path):
             logger.info(f"Reusing existing translation: {transcript_dub_path}")
-            logger.info("Dùng lại bản dịch đã có — đỡ chờ")
             segments = self._load_translation(transcript_dub_path, segments, target)
-            _refresh_subs(segments, work_dir, target, subtitle_style)
-            # The hint file is no longer needed once the translation exists
+            _refresh_subs(segments)
             hint_leftover = os.path.join(work_dir, "TRANSLATE_PENDING.txt")
-            if os.path.exists(hint_leftover):
-                os.remove(hint_leftover)
+            if os.path.exists(hint_leftover): os.remove(hint_leftover)
             rep.emit("translate", "done", detail=transcript_dub_path)
-        else:
-            translated = self._auto_translate(segments, target,
-                                              req.source_lang,
-                                              work_dir=work_dir)
-            if translated is None:
-                # Rẽ sang dịch tay. Hold GIỮ NGUYÊN: giá đã chốt và trừ đủ từ
-                # lúc giữ chỗ nên không có gì để hoàn, còn giữ hold thì lượt
-                # chạy lại nhận lại đúng khóa để mở file đã mã hóa. Hướng dẫn
-                # chỉ cần nói rõ là không phát sinh thêm Vox.
-                refund_note = self._money_note_for_manual()
-                from autodub.text.translate_hint import write_hint
-                hint_path = write_hint(work_dir, target, req.source_lang,
-                                       settings=self.settings,
-                                       refund_note=refund_note)
-                # Dòng info tiếng Anh cho console/dev; warning tiếng Việt là
-                # dòng người dùng thấy trong Nhật ký.
-                logger.info("Translation pending — see TRANSLATE_PENDING.txt in work dir")
-                logger.warning("Video đang chờ bản dịch — xem hướng dẫn "
-                               "3 bước hiện trên màn hình")
-                rep.emit("translate", "start", detail=hint_path)
-                # Let the background separation finish before stopping: the
-                # result is cached on disk, so the resume run reuses it.
-                _bg_result()
-                # Don't hold TTS resources while waiting for a manual
-                # translation (cache-owned synths stay alive — the batch
-                # owner closes them).
-                if (self._synth_cache is None and tts_synth is not None
-                        and hasattr(tts_synth, "close")):
-                    tts_synth.close()
-                return DubResult(status="translate_pending", work_dir=work_dir)
+            return segments
 
-            # Persist before validating so the file is editable and the next
-            # run hits the cached branch above (resume-safe, same as manual).
-            from autodub.speech.transcriber import save_transcript
-            save_transcript(translated, transcript_dub_path)
-            if self._hold.active:
-                # Bản dịch trả phí — mã hóa trên đĩa cho tới khi commit hold.
-                from autodub import securestore
-                securestore.encrypt_file(transcript_dub_path, self._hold.key)
-                securestore.add_locked_file(work_dir, self._hold.hold_id,
-                                            transcript_dub_path)
-            segments = self._load_translation(transcript_dub_path, segments, target)
-            _refresh_subs(segments, work_dir, target, subtitle_style)
-            rep.emit("translate", "done", detail=transcript_dub_path)
+        translated = self._auto_translate(segments, target, source_lang, work_dir=work_dir)
+        if translated is None:
+            from autodub.text.translate_hint import write_hint
+            hint_path = write_hint(work_dir, target, source_lang, settings=self.settings, refund_note=self._money_note_for_manual())
+            rep.emit("translate", "start", detail=hint_path)
+            try: bg_future.result()
+            except Exception: pass
+            if self._synth_cache is None and self._active_synth is not None:
+                if hasattr(self._active_synth, "close"): self._active_synth.close()
+            return DubResult(status="translate_pending", work_dir=work_dir)
 
-        # --- Step 5: TTS ---
-        # Strict 1:1 rendering: every translated segment becomes exactly one
-        # spoken clip, placed at its original start time. Voice, subtitles,
-        # translation and editor all share Whisper's per-fragment timeline —
-        # nothing is grouped, so clips can never pile onto each other.
+        from autodub.speech.transcriber import save_transcript
+        save_transcript(translated, transcript_dub_path)
+        if self._hold.active:
+            from autodub import securestore
+            securestore.encrypt_file(transcript_dub_path, self._hold.key)
+            securestore.add_locked_file(work_dir, self._hold.hold_id, transcript_dub_path)
+        segments = self._load_translation(transcript_dub_path, segments, target)
+        _refresh_subs(segments)
+        rep.emit("translate", "done", detail=transcript_dub_path)
+        return segments
+
+    def _step_tts(self, segments: list[dict], target: TargetLang, voice: str | None,
+                   work_dir: str) -> list[dict]:
+        rep = self._reporter
         rep.check_cancelled()
         logger.info("=" * 60)
         logger.info(f"STEP 5: Synthesizing {target.name} audio (TTS)")
-        logger.info(f"Bắt đầu tạo giọng đọc cho {len(segments)} câu — "
-                    "bước lâu nhất, tiến độ hiện ở khung bên trái...")
         seg_dir = ensure_dir(data_path(work_dir, "segments", create_dir=True))
         self._ensure_render_mode(work_dir, seg_dir)
-        tts_results = self._synthesize_segments(target, req.voice, segments,
-                                                seg_dir, synth=tts_synth)
-        # Free the TTS workers' VRAM before the NVENC video encode — unless a
-        # batch cache owns them (the next video reuses the warm pool).
-        if (self._synth_cache is None and tts_synth is not None
-                and hasattr(tts_synth, "close")):
-            tts_synth.close()
+        tts_results = self._synthesize_segments(target, voice, segments, seg_dir, synth=self._active_synth)
+        if self._synth_cache is None and self._active_synth is not None:
+            if hasattr(self._active_synth, "close"): self._active_synth.close()
+        return tts_results
 
-        # --- Step 5.5: Video speed (optional) — slow the WHOLE video by
-        # VIDEO_SPEED (e.g. 0.82) so the naturally-longer dub simply fits.
-        # One uniform factor: no per-segment fitting, no trimming ever.
-        # Mutates segments onto the slowed timeline; on failure returns None
-        # and the run continues on the original video.
-        background_path, background_gain_db = _bg_result()
-        deferred_speed: tuple[float, str] | None = None
+    def _step_retime(self, segments: list[dict], video_path: str, background_path: str,
+                      work_dir: str, req: DubRequest, subtitle_style: dict) -> tuple[str, str, tuple[float, str] | None]:
+        settings = self.settings
+        rep = self._reporter
+        deferred_speed = None
         if settings.video_speed < 0.999 and not req.skip_video:
             rep.check_cancelled()
             logger.info("=" * 60)
-            logger.info(f"STEP 5.5: Slowing video ({settings.video_speed}x)")
-            from autodub.media.retime import (
-                apply_video_speed,
-                defer_video_speed,
-                rescale_blur_regions,
-            )
-            # Video đằng nào cũng mã hóa lại ở bước ghép (phụ đề ghi vào
-            # hình / che chữ) → gộp setpts vào lượt đó, đỡ nguyên một lần
-            # encode toàn bộ video. Không mã hóa lại thì đi đường rời như cũ.
+            from autodub.media.retime import apply_video_speed, defer_video_speed, rescale_blur_regions
+            from autodub.text.subtitles import refresh_subtitles
             deferred = None
             if req.subtitle_mode == "burn" or req.blur_regions:
-                deferred = defer_video_speed(video_path, background_path,
-                                             segments, work_dir, settings)
+                deferred = defer_video_speed(video_path, background_path, segments, work_dir, settings)
             if deferred is not None:
-                if deferred[0] is not None:
-                    background_path = deferred[0]
+                if deferred[0] is not None: background_path = deferred[0]
                 deferred_speed = (float(settings.video_speed), deferred[2])
-                if req.blur_regions:
-                    req.blur_regions = rescale_blur_regions(
-                        req.blur_regions, deferred[1])
-                _refresh_subs(segments, work_dir, target, subtitle_style)
+                if req.blur_regions: req.blur_regions = rescale_blur_regions(req.blur_regions, deferred[1])
+                refresh_subtitles(segments, work_dir, get_target(req.target), subtitle_style)
             else:
-                slowed = apply_video_speed(video_path, background_path,
-                                           segments, work_dir, settings)
+                slowed = apply_video_speed(video_path, background_path, segments, work_dir, settings)
                 if slowed is not None:
-                    video_path = slowed[0]
-                    if slowed[1] is not None:
-                        background_path = slowed[1]
-                    # Blur windows + SRT follow the slowed timeline; the dub
-                    # transcript keeps ORIGINAL timestamps on disk so a resume
-                    # rescales from the same base (and reuses the cached encode).
-                    if req.blur_regions:
-                        req.blur_regions = rescale_blur_regions(
-                            req.blur_regions, slowed[2])
-                    _refresh_subs(segments, work_dir, target, subtitle_style)
+                    video_path, background_path = slowed[0], slowed[1] or background_path
+                    if req.blur_regions: req.blur_regions = rescale_blur_regions(req.blur_regions, slowed[2])
+                    refresh_subtitles(segments, work_dir, get_target(req.target), subtitle_style)
+        return video_path, background_path, deferred_speed
 
-        # --- Step 6: voice speed + merge audio ---
+    def _step_merge_audio(self, segments: list[dict], work_dir: str, background_path: str,
+                           background_gain_db: float, deferred_speed: tuple[float, str] | None,
+                           video_path: str, target: TargetLang, subtitle_style: dict) -> tuple[str, str, str]:
+        settings = self.settings
+        rep = self._reporter
         rep.check_cancelled()
         logger.info("=" * 60)
         rep.emit("merge_audio", "start")
-        total_duration = max(seg["end"] for seg in segments) + 1.0 if segments else 0
-
-        # Hậu kỳ giọng: loudnorm + highpass + fade cho TỪNG clip — mọi giọng
-        # ra cùng một mức âm lượng cảm nhận, hết click đầu
-        # câu. VOICE_SPEED (atempo) gộp luôn vào cùng lệnh ffmpeg — mỗi câu
-        # chỉ tốn MỘT tiến trình con thay vì hai.
+        seg_dir = data_path(work_dir, "segments")
         merge_src = seg_dir
-        voice_speed = self.settings.voice_speed
-        speed_in_post = (settings.voice_postprocess
-                         and abs(voice_speed - 1.0) >= 0.005)
+        voice_speed = settings.voice_speed
+        speed_in_post = settings.voice_postprocess and abs(voice_speed - 1.0) >= 0.005
+
         if settings.voice_postprocess:
-            logger.info("STEP 6a: Voice postprocess (loudnorm, fade, highpass)")
-            logger.info("Đang cân chỉnh âm lượng các câu cho đều nhau...")
             from autodub.media.audio import postprocess_voice_clips
-            # Tên thư mục mang hệ số tốc độ — đổi VOICE_SPEED giữa hai lần
-            # chạy thì cache cũ tự bị bỏ qua (resume-safe).
-            post_dir = ("segments_post" if not speed_in_post else
-                        f"segments_post_speed{voice_speed:.2f}".replace(".", "_"))
-            merge_src = postprocess_voice_clips(
-                segments, seg_dir, data_path(work_dir, post_dir),
-                target_lufs=settings.voice_target_lufs,
-                max_workers=min(8, settings.parallel_workers),
-                speed=voice_speed if speed_in_post else 1.0,
-                on_done=lambda n, t: rep.emit("merge_audio", "progress",
-                                              current=n, total=t))
+            post_dir = "segments_post" if not speed_in_post else f"segments_post_speed{voice_speed:.2f}".replace(".", "_")
+            merge_src = postprocess_voice_clips(segments, seg_dir, data_path(work_dir, post_dir),
+                                                target_lufs=settings.voice_target_lufs,
+                                                max_workers=min(8, settings.parallel_workers),
+                                                speed=voice_speed if speed_in_post else 1.0,
+                                                on_done=lambda n, t: rep.emit("merge_audio", "progress", current=n, total=t))
 
-        merge_dir = (merge_src if speed_in_post
-                     else self._apply_voice_speed(segments, merge_src, work_dir))
-
-        # Chống chồng tiếng mềm: đặt lại vị trí clip (ưu tiên DỒN TRỄ vào
-        # khoảng lặng — tốc độ đọc mọi câu giữ nguyên; nén nhẹ chỉ khi bất
-        # khả kháng, trần thấp). Chạy trên clip ĐÃ hậu kỳ + voice_speed để
-        # số đo thời lượng là thật. Mutates segments → SRT làm lại bên dưới.
-        timing_report = None
+        merge_dir = merge_src if speed_in_post else self._apply_voice_speed(segments, merge_src, work_dir)
+        timing_report_dict = {}
         if settings.soft_timing_fit:
             from autodub.media.timing import apply_soft_timing
-            merge_dir, timing_report = apply_soft_timing(
-                segments, merge_dir, data_path(work_dir, "segments_timed"),
-                settings, max_workers=min(8, settings.parallel_workers))
-            _refresh_subs(segments, work_dir, target, subtitle_style)
+            from autodub.text.subtitles import refresh_subtitles
+            merge_dir, timing_report = apply_soft_timing(segments, merge_dir, data_path(work_dir, "segments_timed"),
+                                                         settings, max_workers=min(8, settings.parallel_workers))
+            timing_report_dict = timing_report.to_dict() if timing_report else {}
+            refresh_subtitles(segments, work_dir, target, subtitle_style)
 
-        # A long clip may run past the last segment's end — extend the mix
-        # so the merge never cuts a clip at the timeline boundary.
-        from autodub.media.audio import wav_duration_s
+        from autodub.media.audio import wav_duration_s, merge_segments
+        from autodub.media.video import probe_duration_s
+        total_duration = max(seg["end"] for seg in segments) + 1.0 if segments else 0
         for seg in segments:
             dur = wav_duration_s(seg_wav_path(merge_dir, seg["id"]))
-            if dur:
-                total_duration = max(total_duration, seg["start"] + dur + 0.5)
+            if dur: total_duration = max(total_duration, seg["start"] + dur + 0.5)
 
-        # Ensure the output audio covers the entire video duration.
-        from autodub.media.video import probe_duration_s
         video_dur = probe_duration_s(video_path)
         if video_dur:
-            if deferred_speed:
-                video_dur /= deferred_speed[0]
+            if deferred_speed: video_dur /= deferred_speed[0]
             total_duration = max(total_duration, video_dur)
 
-        logger.info("STEP 6: Merging audio segments")
-        logger.info("Đang ghép giọng đọc với nhạc nền...")
         merged_audio_path = data_path(work_dir, target.audio_name)
-        from autodub.media.audio import merge_segments
-        merge_segments(
-            segments, merge_dir, merged_audio_path, total_duration,
-            background_path=background_path,
-            background_gain_db=background_gain_db,
-            duck_voice_db=settings.bg_duck_voice_db,
-        )
+        merge_segments(segments, merge_dir, merged_audio_path, total_duration,
+                       background_path=background_path, background_gain_db=background_gain_db,
+                       duck_voice_db=settings.bg_duck_voice_db)
         rep.emit("merge_audio", "done", detail=merged_audio_path)
+        return merged_audio_path, merge_dir, timing_report_dict
 
-        # Mọi thứ phase Xuất video cần, gói làm một: luồng batch/legacy dùng
-        # ngay tại chỗ; luồng wizard ghi xuống đĩa (mã hóa) rồi DỪNG — bấm
-        # Xuất video mới commit hold và chạy nốt.
+
+    def _run_impl(self, req: DubRequest) -> DubResult:
+        start_time = time.time()
+        settings = self.settings
+        rep = self._reporter
+        target = get_target(req.target)
+        lang_code = resolve_source_lang(req.source_lang)
+
+        # Step 0: Initialize
+        work_dir, folder_name, transcript_orig_path, transcript_dub_path, audio_path = self._init_work_dir(req, target)
+        self._log_machine_info(settings)
+
+        # Step 1: Acquire Video
+        video_path = self._step_acquire_video(req, work_dir)
+
+        # Step 2: Extract Audio
+        hq_audio_path = self._step_extract_audio(video_path, work_dir, audio_path)
+
+        # Step 2.5: Background Separation (started early)
+        from concurrent.futures import ThreadPoolExecutor
+        self._bg_executor = ThreadPoolExecutor(max_workers=1)
+        bg_future = self._bg_executor.submit(self._resolve_background, req.bg_mode, req.bg_duck_db, hq_audio_path, work_dir)
+        self._active_bg_future = bg_future
+
+        from autodub.media.subtitle import normalize_style
+        subtitle_style = normalize_style(req.subtitle_style or settings.subtitle_style())
+
+        # Step 3: ASR
+        segments = self._step_asr(audio_path, lang_code, work_dir, transcript_orig_path, bg_future)
+
+        from autodub.text.translate_hint import annotate_slots
+        annotate_slots(segments)
+
+        # Vox Hold
+        video_duration_s = max(float(s.get("end", 0) or 0) for s in segments)
+        blocked = self._setup_hold(segments, target, work_dir, video_duration_s)
+        if blocked is not None:
+            try: bg_future.result()
+            except Exception: pass
+            return blocked
+
+        # TTS Early Warm-up
+        try:
+            self._active_synth = self._get_synth(target, req.voice)
+            warm = getattr(self._active_synth, "warm_up_async", None)
+            if warm: warm()
+        except Exception as e:
+            logger.warning(f"Bỏ qua khởi động sớm bộ giọng ({e})")
+
+        # Step 4: Translate
+        translate_result = self._step_translate(segments, target, req.source_lang, work_dir, transcript_dub_path, subtitle_style, req, bg_future)
+        if isinstance(translate_result, DubResult):
+            return translate_result
+        segments = translate_result
+
+        # Step 5: TTS
+        tts_results = self._step_tts(segments, target, req.voice, work_dir)
+
+        def _bg_result():
+            try: return bg_future.result()
+            except Exception: return None, 0.0
+
+        # Step 5.5: Retime Video
+        background_path, background_gain_db = _bg_result()
+        video_path, background_path, deferred_speed = self._step_retime(segments, video_path, background_path, work_dir, req, subtitle_style)
+
+        # Step 6: Merge Audio
+        merged_audio_path, merge_dir, timing_report_dict = self._step_merge_audio(segments, work_dir, background_path, background_gain_db, deferred_speed, video_path, target, subtitle_style)
+
+        # Final State and Export
         export_state = {
-            "video_path": video_path,
-            "merged_audio_path": merged_audio_path,
-            "merge_dir": merge_dir,
+            "video_path": video_path, "merged_audio_path": merged_audio_path, "merge_dir": merge_dir,
             "deferred_speed": list(deferred_speed) if deferred_speed else None,
-            "segments": segments,
-            "tts_results": tts_results,
-            "timing": (timing_report.to_dict()
-                       if timing_report is not None else {}),
-            "folder_name": folder_name,
-            "lang_code": lang_code,
-            "target": target.key,
-            "audio_path": audio_path,
-            "subtitle_style": subtitle_style,
-            "url": req.url,
-            "skip_video": req.skip_video,
-            "subtitle_mode": req.subtitle_mode,
-            "blur_regions": req.blur_regions,
-            "voice": req.voice,
+            "segments": segments, "tts_results": tts_results, "timing": timing_report_dict,
+            "folder_name": folder_name, "lang_code": lang_code, "target": target.key,
+            "audio_path": audio_path, "subtitle_style": subtitle_style,
+            "url": req.url, "skip_video": req.skip_video, "subtitle_mode": req.subtitle_mode,
+            "blur_regions": req.blur_regions, "voice": req.voice,
             "elapsed_before": round(time.time() - start_time, 1),
         }
 
         if req.defer_export and self._hold.active:
             return self._stop_for_export(export_state, work_dir)
 
-        # Batch/legacy không có nút Xuất video — chốt hold NGAY TẠI ĐÂY (trước
-        # phase xuất, như thứ tự của luồng wizard): mở khóa file trung gian và
-        # ghi tổng Vox vào sổ. HOLD giữ nguyên qua phase xuất để bước tạo nội
-        # dung đăng bài trỏ đúng hold (gói +20 Vox đã nằm trong giá), rồi mới
-        # xả — không rớt sang video kế tiếp của batch.
         self._settle_hold_inline(work_dir)
         try:
             return self._export_phase(export_state, work_dir, target)
@@ -1283,9 +1143,15 @@ class DubPipeline:
             logger.warning(f"Dịch tự động lỗi ({e}) — chuyển sang dịch tay")
             rep.emit("translate", "error", detail=str(e))
             return None
+        except (OSError, MemoryError):
+            # System-level errors should not be swallowed
+            rep.emit("translate", "error", detail="Lỗi hệ thống (đĩa đầy hoặc hết RAM)")
+            raise
         except Exception as e:
             rep.emit("translate", "error", detail=str(e))
             if provider != "voxdub":
+                # Providers direct like Gemini/OpenRouter should fail the pipeline
+                # if misconfigured.
                 raise RuntimeError(
                     f"Translation provider {provider} failed: {e}. "
                     "Check the API key, Base URL and model in Translation settings."

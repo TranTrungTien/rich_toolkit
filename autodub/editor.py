@@ -960,7 +960,11 @@ def _renumber_and_rename(work_dir: str, segments: list[dict],
 
 
 def _apply_renames(renames: list[tuple[str, str]]) -> None:
-    """Đổi tên hàng loạt qua tên tạm, tránh hai tệp đè lên nhau giữa chừng."""
+    """Đổi tên hàng loạt qua tên tạm, tránh hai tệp đè lên nhau giữa chừng.
+
+    Nếu một tệp ở giai đoạn 2 lỗi, cố gắng ROLLBACK tất cả các tệp đã về tên
+    tạm (.doi_ten_tam) về lại tên gốc để không mất dữ liệu.
+    """
     # Dọn file tạm cũ nếu lần trước crash giữa chừng
     for source, target_path in renames:
         tmp = target_path + ".doi_ten_tam"
@@ -971,18 +975,44 @@ def _apply_renames(renames: list[tuple[str, str]]) -> None:
                 pass
 
     staged: list[tuple[str, str]] = []
-    for source, target_path in renames:
-        temporary = target_path + ".doi_ten_tam"
-        try:
-            os.replace(source, temporary)
-            staged.append((temporary, target_path))
-        except OSError as e:
-            logger.warning(f"Không đổi tên được {source}: {e}")
-    for temporary, target_path in staged:
-        try:
-            os.replace(temporary, target_path)
-        except OSError as e:
-            logger.warning(f"Không đặt lại tên {target_path}: {e}")
+    try:
+        for source, target_path in renames:
+            temporary = target_path + ".doi_ten_tam"
+            try:
+                os.replace(source, temporary)
+                staged.append((temporary, source))  # (tmp, original_source)
+            except OSError as e:
+                logger.error(f"Giai đoạn 1 đổi tên lỗi ({source}): {e}")
+                raise
+
+        # Giai đoạn 2: tmp -> final target
+        finalized: list[tuple[str, str]] = []
+        for temporary, original_source in staged:
+            # Find the target path for this temporary file
+            target_path = next(t for s, t in renames if s == original_source)
+            try:
+                os.replace(temporary, target_path)
+                finalized.append((target_path, temporary))
+            except OSError as e:
+                logger.error(f"Giai đoạn 2 đổi tên lỗi ({target_path}): {e}")
+                # Rollback finalized back to tmp, then staged back to source
+                raise
+    except Exception:
+        logger.warning("Đang rollback các thay đổi tên tệp...")
+        # Rollback Giai đoạn 2 (những tệp đã xong) về lại tmp
+        for target_path, temporary in finalized:
+            try:
+                os.replace(target_path, temporary)
+            except OSError:
+                pass
+        # Rollback Giai đoạn 1 (tất cả tmp) về lại original_source
+        for temporary, original_source in staged:
+            if os.path.exists(temporary):
+                try:
+                    os.replace(temporary, original_source)
+                except OSError:
+                    pass
+        raise
 
 
 def _drop_segment_audio(work_dir: str, seg_id: int) -> None:
@@ -1016,7 +1046,11 @@ def _invalidate_derived(work_dir: str, target: TargetLang) -> None:
 
 def _commit(work_dir: str, target: TargetLang, segments: list[dict],
             path: str, old_ids: list[int]) -> None:
-    """Đánh số lại, đổi tên tệp, xóa tệp dẫn xuất rồi ghi xuống đĩa."""
+    """Đánh số lại, đổi tên tệp, xóa tệp dẫn xuất rồi ghi xuống đĩa.
+
+    Thứ tự: rename trước, nếu thành công mới ghi JSON. Lỗi rename thì không
+    ghi JSON để ID trong JSON và tên file trên đĩa luôn khớp nhau.
+    """
     _renumber_and_rename(work_dir, segments, old_ids)
     _invalidate_derived(work_dir, target)
     save_json_atomic(segments, path)

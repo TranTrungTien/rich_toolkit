@@ -156,7 +156,7 @@ def _fetch_share_info(video_id: str) -> dict | None:
     return None
 
 
-def _download_play_url(uri: str, dest: Path) -> int:
+def _download_play_url(uri: str, dest: Path, stop_event=None) -> int:
     """Download the MP4 via the aweme play endpoint (no watermark)."""
     quoted = urllib.parse.quote(str(uri), safe="")
     url = f"https://aweme.snssdk.com/aweme/v1/play/?video_id={quoted}&ratio=1080p&line=0"
@@ -174,6 +174,8 @@ def _download_play_url(uri: str, dest: Path) -> int:
                 raise RuntimeError(f"Play endpoint returned {content_type}, not video")
             with open(part, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1024 * 256):
+                    if stop_event and stop_event.is_set():
+                        raise RuntimeError("Download cancelled by user")
                     if chunk:
                         f.write(chunk)
                         size += len(chunk)
@@ -301,7 +303,7 @@ def _extract_via_playwright(
     )
 
 
-def _download_stream(url: str, dest: Path) -> int:
+def _download_stream(url: str, dest: Path, stop_event=None) -> int:
     headers = {"User-Agent": _UA, "Referer": _REFERER}
     size = 0
     # Ghi ra .part rồi os.replace — đứt mạng không để lại file cắt cụt.
@@ -311,6 +313,8 @@ def _download_stream(url: str, dest: Path) -> int:
             r.raise_for_status()
             with open(part, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1024 * 256):
+                    if stop_event and stop_event.is_set():
+                        raise RuntimeError("Download cancelled by user")
                     if chunk:
                         f.write(chunk)
                         size += len(chunk)
@@ -358,7 +362,7 @@ def _ffprobe_duration(path: Path) -> float:
         return 0.0
 
 
-def _download_via_playwright(video_id: str, out_dir: Path, final_path: Path) -> dict:
+def _download_via_playwright(video_id: str, out_dir: Path, final_path: Path, stop_event=None) -> dict:
     """Fallback: sniff CDN streams from the share page with a headless browser."""
     share_url = f"https://www.iesdouyin.com/share/video/{video_id}/"
     info = _extract_via_playwright(share_url)
@@ -372,16 +376,16 @@ def _download_via_playwright(video_id: str, out_dir: Path, final_path: Path) -> 
 
     if info["mode"] == "progressive":
         logger.info(f"Downloading progressive MP4 id={video_id}")
-        size = _download_stream(info["video_url"], final_path)
+        size = _download_stream(info["video_url"], final_path, stop_event=stop_event)
         logger.info(f"Stream downloaded: {size:,}B")
     else:
         tmp_video = out_dir / f"_tmp_{video_id}.video.mp4"
         tmp_audio = out_dir / f"_tmp_{video_id}.audio.m4a"
         try:
             logger.info(f"Downloading DASH video stream id={video_id}")
-            v_size = _download_stream(info["video_url"], tmp_video)
+            v_size = _download_stream(info["video_url"], tmp_video, stop_event=stop_event)
             logger.info(f"Downloading DASH audio stream id={video_id}")
-            a_size = _download_stream(info["audio_url"], tmp_audio)
+            a_size = _download_stream(info["audio_url"], tmp_audio, stop_event=stop_event)
             logger.info(f"Streams downloaded: video={v_size:,}B audio={a_size:,}B")
             _ffmpeg_mux(tmp_video, tmp_audio, final_path)
         finally:
@@ -398,6 +402,7 @@ def download_douyin(
     url: str,
     output_dir: str,
     filename: str | None = None,
+    stop_event=None,
 ) -> dict:
     """Download a Douyin video and return metadata matching download_one() shape.
 
@@ -432,7 +437,7 @@ def download_douyin(
     if share_info:
         title = share_info["title"]
         try:
-            size = _download_play_url(share_info["uri"], final_path)
+            size = _download_play_url(share_info["uri"], final_path, stop_event=stop_event)
             logger.info(f"Direct download OK: {size:,}B (uri={share_info['uri']})")
             downloaded = True
         except (requests.RequestException, RuntimeError) as exc:
@@ -441,7 +446,7 @@ def download_douyin(
 
     # --- Fallback: Playwright stream sniffing (share page, id-verified) ---
     if not downloaded:
-        info = _download_via_playwright(video_id, out_dir, final_path)
+        info = _download_via_playwright(video_id, out_dir, final_path, stop_event=stop_event)
         title = title or info["title"]
 
     duration = _ffprobe_duration(final_path)
